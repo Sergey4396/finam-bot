@@ -1,2 +1,2 @@
 finam-trade-api>=4.0.0
-finam-py
+aiohttp

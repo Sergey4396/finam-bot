@@ -1,128 +1,134 @@
 #!/usr/bin/env python3
 """
 Finam bot - автоматический встречный ордер при сделке
-Токен: FINAM_TOKEN=т TOKEN python bot.py
+Токен: FINAM_TOKEN=тOKEN python bot.py
 """
 import os
 import asyncio
+import json
+import aiohttp
 from datetime import datetime
-from threading import Thread
-import time
-import sys
-
-from FinamPy import FinamPy
-import FinamPy.grpc.side_pb2 as side
-from finam_trade_api import Client, TokenManager
-from google.type.decimal_pb2 import Decimal
 
 from config import ACCOUNT_ID, INSTRUMENTS
 
-TOKEN = os.environ.get('FINAM_TOKEN', '')
-if not TOKEN:
+FINAM_TOKEN = os.environ.get('FINAM_TOKEN', '')
+if not FINAM_TOKEN:
     print("Ошибка: нужен FINAM_TOKEN")
     print("FINAM_TOKEN=токен python bot.py")
-    sys.exit(1)
+    exit(1)
 
-SYMBOL = list(INSTRUMENTS.keys())[0]
-PRICE_DELTA = INSTRUMENTS[SYMBOL]
+WS_URL = "wss://api.finam.ru/trading"
+TOKEN_URL = "https://api.finam.ru/v1/auth/token"
 
 SEEN_TRADES = set()
-trade_client = None
 
 
-async def get_trade_client():
-    global trade_client
-    if not trade_client:
-        trade_client = Client(TokenManager(TOKEN))
-        await trade_client.access_tokens.set_jwt_token()
-    return trade_client
+async def get_jwt_token(session, secret_token):
+    async with session.post(TOKEN_URL, json={"secretToken": secret_token}) as resp:
+        data = await resp.json()
+        return data.get("token", "")
 
 
-async def place_order_async(qty, side_name, price):
-    c = await get_trade_client()
-    try:
-        from finam_trade_api.order import Order, OrderType, TimeInForce
-        from finam_trade_api.base_client.models import FinamDecimal, Side
-        
-        order = Order(
-            account_id=ACCOUNT_ID,
-            symbol=SYMBOL,
-            quantity=FinamDecimal(value=str(qty)),
-            side=Side.BUY if side_name == 'BUY' else Side.SELL,
-            type=OrderType.LIMIT,
-            time_in_force=TimeInForce.DAY,
-            limit_price=FinamDecimal(value=str(price)),
-        )
-        result = await c.orders.place_order(order)
-        print(f"  => Ордер создан: {result}")
-        return result
-    except Exception as e:
-        print(f"  => Ошибка: {e}")
-        return None
+async def create_order(session, token, symbol, direction, quantity, price, account_id):
+    url = f"https://api.finam.ru/v1/orders/{account_id}"
+    headers = {"Authorization": f"Bearer {token}"}
+    
+    order_data = {
+        "symbol": symbol,
+        "direction": direction,
+        "quantity": quantity,
+        "price": price,
+        "orderType": "limit",
+        "timeInForce": "day"
+    }
+    
+    async with session.post(url, json=order_data, headers=headers) as resp:
+        return await resp.json()
 
 
-def on_trade(trade):
-    trade_time = trade.timestamp.seconds if trade.timestamp else 0
-    current_time = int(time.time())
-    if current_time - trade_time > 10:
+def process_trade(order, symbol, price_delta, session, jwt_token):
+    direction = order.get("direction", 0)
+    trades = order.get("trades", [])
+    if not trades:
         return
     
-    trade_id = trade.trade_id
-    if not trade_id or trade_id == "0" or trade_id in SEEN_TRADES:
-        return
-    
-    SEEN_TRADES.add(trade_id)
-    if len(SEEN_TRADES) > 100:
-        SEEN_TRADES.clear()
-    
-    price = float(trade.price.value)
-    qty = float(trade.size.value) if trade.size else 1.0
-    
-    trade_side = trade.side
-    side_name = "BUY" if trade_side == 1 else "SELL" if trade_side == 2 else str(trade_side)
-    
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] Сделка: {side_name} {int(qty)} @ {price}")
-    
-    if price and qty:
-        counter_price = round(price + PRICE_DELTA, 3) if trade_side == 1 else round(price - PRICE_DELTA, 3)
-        counter_side = "SELL" if trade_side == 1 else "BUY"
+    for trade in trades:
+        trade_id = str(trade.get("tradeId", ""))
+        if not trade_id or trade_id in SEEN_TRADES:
+            continue
         
-        print(f"  => Выставляю {counter_side} {int(qty)} @ {counter_price}")
+        SEEN_TRADES.add(trade_id)
+        if len(SEEN_TRADES) > 100:
+            SEEN_TRADES.clear()
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            loop.run_until_complete(place_order_async(int(qty), counter_side, counter_price))
-        finally:
-            loop.close()
+        price = float(trade.get("price", 0))
+        quantity = int(trade.get("quantity", 0))
+        
+        counter_direction = 2 if direction == 1 else 1
+        counter_price = round(price + price_delta, 3) if direction == 1 else round(price - price_delta, 3)
+        
+        action = "BUY" if counter_direction == 1 else "SELL"
+        
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Сделка: {action} {quantity} @ {price}")
+        print(f"  => Выставляю {'SELL' if direction == 1 else 'BUY'} {quantity} @ {counter_price}")
+        
+        asyncio.create_task(create_order(
+            session, jwt_token, symbol, counter_direction,
+            quantity, counter_price, ACCOUNT_ID
+        ))
 
 
-def on_order(order):
-    print(f"DEBUG: Заявка: {order.order_id}, status={order.status}")
-
-
-def main():
-    fp_provider = FinamPy(TOKEN)
+async def main():
+    print("=== Finam Bot ===")
+    print(f"Мониторим: {list(INSTRUMENTS.keys())}")
     
-    print(f"=== Finam Bot ===")
-    print(f"Мониторим: {SYMBOL}")
-    print(f"Отступ: {PRICE_DELTA}")
-    
-    fp_provider.on_trade.subscribe(on_trade)
-    fp_provider.on_order.subscribe(on_order)
-    Thread(target=fp_provider.subscribe_trades_thread).start()
-    Thread(target=fp_provider.subscribe_orders_thread).start()
-    
-    print("Бот запущен. Ожидание сделок...")
-    
-    try:
-        while True:
-            pass
-    except KeyboardInterrupt:
-        pass
-    finally:
-        fp_provider.close_channel()
+    async with aiohttp.ClientSession() as session:
+        print("Получение токена...")
+        jwt_token = await get_jwt_token(session, FINAM_TOKEN)
+        print("Токен получен")
+        
+        ws = await session.ws_connect(WS_URL)
+        
+        symbol = list(INSTRUMENTS.keys())[0]
+        price_delta = INSTRUMENTS[symbol]
+        
+        subscribe_msg = {
+            "action": "SUBSCRIBE",
+            "type": "ORDERS",
+            "token": jwt_token,
+            "data": {"symbols": [symbol]}
+        }
+        await ws.send_json(subscribe_msg)
+        
+        print("Бот запущен. Ожидание сделок...")
+        
+        async for msg in ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    data = json.loads(msg.data)
+                    msg_type = data.get("type")
+                    
+                    if msg_type == "SUBSCRIPTION":
+                        print(f"Подписка: {data}")
+                    elif msg_type == "DATA":
+                        payload = data.get("payload", {})
+                        orders = payload.get("orders", [])
+                        for order in orders:
+                            if order.get("symbol") == symbol:
+                                process_trade(order, symbol, price_delta, session, jwt_token)
+                    elif msg_type == "PING":
+                        pass
+                    elif msg_type == "ERROR":
+                        print(f"Ошибка: {data}")
+                except Exception as e:
+                    print(f"Ошибка: {e}")
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                print("WebSocket ошибка")
+                break
+            elif msg.type == aiohttp.WSMsgType.CLOSED:
+                print("WebSocket закрыт")
+                break
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    asyncio.run(main())
