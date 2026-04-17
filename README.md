@@ -11,24 +11,20 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Настройка
-
-Отредактируй `config.py`:
-
-```python
-FINAM_SECRET_TOKEN = "твой_токен"  # Сгенерировать на finam.ru
-ACCOUNT_ID = "KЛФ-XXXXXXXX"
-```
-
 ## Запуск
 
 ```bash
 source venv/bin/activate
-python bot.py
+FINAM_TOKEN=твой_токен python bot.py
 ```
 
-## Символы фьючерсов FORTS
+## Пример
 
-- NGM6@FORTS - Нефть Brent (NRJ6)
-- BRK6@FORTS - Нефть Brent
-- SiK6@FORTS - Доллар-рубль
+```bash
+FINAM_TOKEN=eyJraWQi... python bot.py
+```
+
+## Мониторинг
+
+- NRJ6@RTSX - фьючерс на газ (апрель 2026)
+- Отступ: 0.020

@@ -1,14 +1,14 @@
 """
 Finam bot configuration
+Токен передаётся через переменную окружения FINAM_TOKEN
 """
 
-FINAM_SECRET_TOKEN = "YOUR_SECRET_TOKEN"  # Сгенерировать на портале finam.ru
-
-ACCOUNT_ID = "YOUR_ACCOUNT_ID"  # Счёт в формате КЛФ-XXXXXXXX
+# Счёт
+ACCOUNT_ID = "2038952"
 
 # Отслеживаемые инструменты
-# Для фьючерсов формат: code + month + year
-# Пример: NRJ6 -> NRM (месяц: 6=июнь)
+# Для фьючерсов: код + месяц (J=апрель) + год
+# NRJ6 - газ, April 2026
 INSTRUMENTS = {
-    "NGM6@FORTS": 0.022,  # NRJ6 - фьючерс на нефть Brent
+    "NRJ6@RTSX": 0.020,  # NRJ6 - фьючерс на газ (апрель)
 }

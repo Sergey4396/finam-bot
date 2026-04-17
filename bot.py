@@ -1,153 +1,128 @@
+#!/usr/bin/env python3
 """
 Finam bot - автоматический встречный ордер при сделке
+Токен: FINAM_TOKEN=т TOKEN python bot.py
 """
+import os
 import asyncio
-import json
-import aiohttp
-from config import FINAM_SECRET_TOKEN, ACCOUNT_ID, INSTRUMENTS
+from datetime import datetime
+from threading import Thread
+import time
+import sys
 
-WS_URL = "wss://api.finam.ru/trading"
-TOKEN_URL = "https://api.finam.ru/v1/auth/token"
-REFRESH_URL = "https://api.finam.ru/v1/auth/refresh"
+from FinamPy import FinamPy
+import FinamPy.grpc.side_pb2 as side
+from finam_trade_api import Client, TokenManager
+from google.type.decimal_pb2 import Decimal
 
+from config import ACCOUNT_ID, INSTRUMENTS
 
-async def get_jwt_token(session, secret_token):
-    """Получение JWT токена"""
-    async with session.post(TOKEN_URL, json={"secretToken": secret_token}) as resp:
-        data = await resp.json()
-        return data.get("token", "")
+TOKEN = os.environ.get('FINAM_TOKEN', '')
+if not TOKEN:
+    print("Ошибка: нужен FINAM_TOKEN")
+    print("FINAM_TOKEN=токен python bot.py")
+    sys.exit(1)
 
+SYMBOL = list(INSTRUMENTS.keys())[0]
+PRICE_DELTA = INSTRUMENTS[SYMBOL]
 
-async def refresh_token(session, secret_token):
-    """Обновление JWT токена"""
-    async with session.post(REFRESH_URL, json={"secretToken": secret_token}) as resp:
-        data = await resp.json()
-        return data.get("token", "")
-
-
-async def create_order(session, token, symbol, direction, quantity, price, account_id):
-    """Создание ордера"""
-    url = f"https://api.finam.ru/v1/orders/{account_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    
-    order_data = {
-        "symbol": symbol,
-        "direction": direction,  # 1 = buy, 2 = sell
-        "quantity": quantity,
-        "price": price,
-        "orderType": "limit",
-        "timeInForce": "day"
-    }
-    
-    async with session.post(url, json=order_data, headers=headers) as resp:
-        return await resp.json()
+SEEN_TRADES = set()
+trade_client = None
 
 
-async def on_trade(order, symbol, price_delta, session, jwt_token):
-    """Обработка сделки"""
-    direction = order.get("direction", 0)
-    is_buy = direction == 1
-    
-    trades = order.get("trades", [])
-    if not trades:
+async def get_trade_client():
+    global trade_client
+    if not trade_client:
+        trade_client = Client(TokenManager(TOKEN))
+        await trade_client.access_tokens.set_jwt_token()
+    return trade_client
+
+
+async def place_order_async(qty, side_name, price):
+    c = await get_trade_client()
+    try:
+        from finam_trade_api.order import Order, OrderType, TimeInForce
+        from finam_trade_api.base_client.models import FinamDecimal, Side
+        
+        order = Order(
+            account_id=ACCOUNT_ID,
+            symbol=SYMBOL,
+            quantity=FinamDecimal(value=str(qty)),
+            side=Side.BUY if side_name == 'BUY' else Side.SELL,
+            type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY,
+            limit_price=FinamDecimal(value=str(price)),
+        )
+        result = await c.orders.place_order(order)
+        print(f"  => Ордер создан: {result}")
+        return result
+    except Exception as e:
+        print(f"  => Ошибка: {e}")
+        return None
+
+
+def on_trade(trade):
+    trade_time = trade.timestamp.seconds if trade.timestamp else 0
+    current_time = int(time.time())
+    if current_time - trade_time > 10:
         return
     
-    # Противоположное направление
-    counter_direction = 2 if is_buy else 1  # 1=buy, 2=sell
-    price_delta_dir = -price_delta if is_buy else price_delta
+    trade_id = trade.trade_id
+    if not trade_id or trade_id == "0" or trade_id in SEEN_TRADES:
+        return
     
-    for trade in trades:
-        price = float(trade.get("price", 0))
-        quantity = int(trade.get("quantity", 0))
+    SEEN_TRADES.add(trade_id)
+    if len(SEEN_TRADES) > 100:
+        SEEN_TRADES.clear()
+    
+    price = float(trade.price.value)
+    qty = float(trade.size.value) if trade.size else 1.0
+    
+    trade_side = trade.side
+    side_name = "BUY" if trade_side == 1 else "SELL" if trade_side == 2 else str(trade_side)
+    
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Сделка: {side_name} {int(qty)} @ {price}")
+    
+    if price and qty:
+        counter_price = round(price + PRICE_DELTA, 3) if trade_side == 1 else round(price - PRICE_DELTA, 3)
+        counter_side = "SELL" if trade_side == 1 else "BUY"
         
-        counter_price = round(price + price_delta_dir, 3)
-        action = "ПОКУПКУ" if counter_direction == 1 else "ПРОДАЖУ"
+        print(f"  => Выставляю {counter_side} {int(qty)} @ {counter_price}")
         
-        print(f"  => Сделка: {symbol} {quantity} @ {price}")
-        print(f"  => Ордер на {action}: {quantity} @ {counter_price}")
-        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            result = await create_order(
-                session, jwt_token, 
-                symbol, counter_direction, 
-                quantity, counter_price, 
-                ACCOUNT_ID
-            )
-            print(f"  => Ордер создан: {result}")
-        except Exception as e:
-            print(f"  => Ошибка: {e}")
+            loop.run_until_complete(place_order_async(int(qty), counter_side, counter_price))
+        finally:
+            loop.close()
 
 
-async def process_message(msg, session, jwt_token):
-    """Обработка сообщения от WebSocket"""
-    msg_type = msg.get("type")
-    
-    if msg_type == "SUBSCRIPTION":
-        print(f"Подписка: {msg.get('subscription_key')}")
-    
-    elif msg_type == "DATA":
-        payload = msg.get("payload", {})
-        orders = payload.get("orders", [])
-        
-        for order in orders:
-            symbol = order.get("symbol", "")
-            if symbol not in INSTRUMENTS:
-                continue
-            
-            await on_trade(order, symbol, INSTRUMENTS[symbol], session, jwt_token)
-    
-    elif msg_type == "PING":
-        print(f"Ping")
-    
-    elif msg_type == "ERROR":
-        print(f"Ошибка: {msg}")
+def on_order(order):
+    print(f"DEBUG: Заявка: {order.order_id}, status={order.status}")
 
 
-async def main():
-    print("=== Finam Bot ===")
-    print(f"Мониторим: {list(INSTRUMENTS.keys())}")
+def main():
+    fp_provider = FinamPy(TOKEN)
     
-    session = aiohttp.ClientSession()
+    print(f"=== Finam Bot ===")
+    print(f"Мониторим: {SYMBOL}")
+    print(f"Отступ: {PRICE_DELTA}")
     
-    print("Получение токена...")
-    jwt_token = await get_jwt_token(session, FINAM_SECRET_TOKEN)
-    print("Токен получен")
-    
-    print("Подключение к WebSocket...")
-    
-    ws = await session.ws_connect(WS_URL)
-    
-    # Подписка на ордера
-    subscribe_msg = {
-        "action": "SUBSCRIBE",
-        "type": "ORDERS",
-        "token": jwt_token,
-        "data": {
-            "symbols": list(INSTRUMENTS.keys())
-        }
-    }
-    
-    await ws.send_json(subscribe_msg)
+    fp_provider.on_trade.subscribe(on_trade)
+    fp_provider.on_order.subscribe(on_order)
+    Thread(target=fp_provider.subscribe_trades_thread).start()
+    Thread(target=fp_provider.subscribe_orders_thread).start()
     
     print("Бот запущен. Ожидание сделок...")
     
-    # Обработка сообщений
-    async for msg in ws:
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data = json.loads(msg.data)
-                await process_message(data, session, jwt_token)
-            except Exception as e:
-                print(f"Ошибка обработки: {e}")
-        elif msg.type == aiohttp.WSMsgType.ERROR:
-            print(f"WebSocket ошибка")
-            break
-        elif msg.type == aiohttp.WSMsgType.CLOSED:
-            print("WebSocket закрыт")
-            break
-    
-    await session.close()
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        pass
+    finally:
+        fp_provider.close_channel()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    main()
