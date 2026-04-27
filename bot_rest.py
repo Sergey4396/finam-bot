@@ -19,9 +19,9 @@ ACCOUNT_ID = "2038952"
 SYMBOL = "NRJ6@RTSX"
 PRICE_DELTA = 0.020
 
-AUTH_URL = "https://api.finam.ru/v1/auth/token"
+AUTH_URL = "https://api.finam.ru/v1/token"
 ORDERS_URL = f"https://api.finam.ru/v1/orders/{ACCOUNT_ID}"
-WS_URL = "wss://api.finam.ru/trading"
+WS_URL = "wss://api.finam.ru/tradinginfo"
 
 SEEN = set()
 
